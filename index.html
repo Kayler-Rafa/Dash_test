@@ -311,9 +311,15 @@ a{color:inherit;text-decoration:none}
 .master-notes-wrap{max-width:720px}
 .notes-toolbar{display:flex;gap:10px;margin-bottom:12px;flex-wrap:wrap}
 
-/* ── PLAYER VIEW ── */
-#view-player{background:var(--bg);align-items:flex-start;justify-content:center;padding:32px 16px}
-.player-wrap{max-width:680px;width:100%;margin:0 auto}
+/* ── PLAYER 2-COL LAYOUT ── */
+#view-player{background:var(--bg);align-items:flex-start;justify-content:center;padding:0}
+.player-root{display:grid;grid-template-columns:1fr 280px;min-height:100vh;width:100%;max-width:1100px;margin:0 auto}
+.player-main{padding:28px 24px;overflow-y:auto}
+.player-dice-sidebar{background:var(--bg2);border-left:1px solid var(--line);padding:20px 16px;position:sticky;top:0;height:100vh;overflow-y:auto;display:flex;flex-direction:column;}
+@media(max-width:700px){
+  .player-root{grid-template-columns:1fr}
+  .player-dice-sidebar{position:fixed;bottom:0;left:0;right:0;height:auto;max-height:45vh;border-left:none;border-top:1px solid var(--line2);z-index:50;overflow-y:auto;}
+}
 .player-top{display:flex;align-items:center;gap:18px;margin-bottom:28px;padding-bottom:22px;border-bottom:1px solid var(--line)}
 .player-av{width:68px;height:68px;border-radius:50%;background:var(--bg3);border:1px solid var(--line);overflow:hidden;display:flex;align-items:center;justify-content:center;font-size:26px;flex-shrink:0}
 .player-av img{width:100%;height:100%;object-fit:cover}
@@ -323,7 +329,11 @@ a{color:inherit;text-decoration:none}
 .p-vital{background:var(--bg2);border:1px solid var(--line);border-radius:var(--rad);padding:14px}
 .p-vital-label{font-family:var(--mono);font-size:9px;letter-spacing:.18em;color:var(--dim);text-transform:uppercase;margin-bottom:6px}
 .p-vital-val{font-size:22px;font-weight:300;font-family:var(--mono);margin-bottom:6px}
-.p-vital-bar{height:3px;background:var(--bg5);border-radius:2px;overflow:hidden;margin-bottom:8px}
+.p-vital-ctrl{display:flex;align-items:center;gap:4px;margin-top:6px}
+.p-vital-btn{width:28px;height:28px;background:var(--bg3);border:1px solid var(--line);color:var(--text);cursor:pointer;border-radius:var(--rad);display:flex;align-items:center;justify-content:center;font-size:15px;line-height:1;transition:all .15s;font-family:var(--mono)}
+.p-vital-btn:hover{border-color:var(--line2);background:var(--bg4)}
+.p-vital-btn.p-minus:hover{border-color:rgba(255,69,69,.4);color:var(--red)}
+.p-vital-btn.p-plus:hover{border-color:rgba(200,255,0,.4);color:var(--acc)}
 .p-vital-fill-hp{height:100%;background:var(--acc);border-radius:2px}
 .p-vital-fill-san{height:100%;background:var(--blue);border-radius:2px}
 .p-vital-inputs{display:flex;gap:6px;align-items:center}
@@ -626,7 +636,7 @@ a{color:inherit;text-decoration:none}
 
 <!-- =============== PLAYER VIEW =============== -->
 <div class="view" id="view-player">
-  <div class="player-wrap" id="player-body"></div>
+  <div id="player-body" style="width:100%;"></div>
 </div>
 <script>
 // ═══════════════════════════════════════════
@@ -775,17 +785,25 @@ function setConn(state) {
 
 function setupRealtime() {
   if (!SB) return;
-  realtimeChannel = SB.channel('master-realtime')
-    .on('postgres_changes', { event: '*', schema: 'public', table: 'sheets' }, () => {
-      renderSheets(); renderCombat();
+  if (realtimeChannel) { SB.removeChannel(realtimeChannel); }
+
+  realtimeChannel = SB.channel('master-realtime', {
+    config: { broadcast: { self: false } }
+  })
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'sheets' }, async () => {
+      await renderSheets();
+      await renderCombat();
     })
-    .on('postgres_changes', { event: '*', schema: 'public', table: 'combat' }, () => {
-      renderCombat();
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'combat' }, async () => {
+      await renderCombat();
     })
     .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'dice_log' }, (payload) => {
-      prependDiceLogItem(payload.new, 'dice-feed');
+      if (payload.new) prependDiceLogItem(payload.new, 'dice-feed');
     })
-    .subscribe();
+    .subscribe((status) => {
+      if (status === 'SUBSCRIBED') setConn('ok');
+      else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') setConn('err');
+    });
 }
 
 // ═══════════════════════════════════════════
@@ -963,7 +981,7 @@ async function addToCombat() {
 async function renderCombat() {
   if (!SB) return;
   const { data: combatRows } = await SB.from('combat').select('*').eq('active', true).order('position');
-  const { data: sheets } = await SB.from('sheets').select('id,name,type,photo,hp_cur,hp_max,san_cur,san_max');
+  const { data: sheets } = await SB.from('sheets').select('id,name,type,photo,hp_cur,hp_max,san_cur,san_max,weapons,items');
   const list = document.getElementById('combatant-list');
   if (!list) return;
 
@@ -984,33 +1002,87 @@ async function renderCombat() {
     const hpClass = hpPct > 60 ? 'bar-hp' : hpPct > 30 ? 'bar-hp mid' : 'bar-hp low';
     const typeLabel = { player: 'Jogador', npc: 'NPC', enemy: 'Inimigo' }[type] || type;
 
+    // Weapons summary
+    const weapons = s.weapons || [];
+    const items = s.items || [];
+    let expandHtml = '';
+    if (weapons.length > 0 || items.length > 0) {
+      let weapHtml = weapons.map(w => `
+        <div style="padding:6px 0;border-bottom:1px solid var(--line);">
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;">
+            ${w.photo ? `<img src="${w.photo}" style="width:28px;height:28px;border-radius:2px;object-fit:cover;">` : ''}
+            <span style="font-size:12px;font-weight:500;">${w.name || 'Arma'}</span>
+          </div>
+          <div style="display:flex;gap:8px;">
+            ${w.dmg_5 ? `<span style="font-family:var(--mono);font-size:10px;color:var(--red);">5m: ${w.dmg_5}</span>` : ''}
+            ${w.dmg_10 ? `<span style="font-family:var(--mono);font-size:10px;color:var(--red);">10m: ${w.dmg_10}</span>` : ''}
+            ${w.dmg_15 ? `<span style="font-family:var(--mono);font-size:10px;color:var(--red);">15m: ${w.dmg_15}</span>` : ''}
+          </div>
+          ${(w.attachments||[]).length > 0 ? `<div style="margin-top:4px;font-size:10px;color:var(--muted);">Apetrechos: ${w.attachments.map(a=>a.name).filter(Boolean).join(', ')}</div>` : ''}
+        </div>
+      `).join('');
+      let itemHtml = items.map(it => `
+        <div style="display:flex;align-items:center;gap:8px;padding:4px 0;border-bottom:1px solid var(--line);">
+          <span style="font-size:11px;flex:1;">${it.name}</span>
+          ${it.category ? `<span style="font-family:var(--mono);font-size:9px;color:var(--dim);letter-spacing:.08em;">${it.category}</span>` : ''}
+          ${it.damage ? `<span style="font-family:var(--mono);font-size:10px;color:var(--red);">${it.damage}</span>` : ''}
+        </div>
+      `).join('');
+      expandHtml = `
+        <div class="c-expand" id="expand-${row.id}" style="display:none;padding:10px 16px 12px;border-top:1px solid var(--line);background:var(--bg3);">
+          ${weapons.length > 0 ? `<div style="font-family:var(--mono);font-size:9px;letter-spacing:.15em;color:var(--dim);text-transform:uppercase;margin-bottom:6px;">Armas</div>${weapHtml}` : ''}
+          ${items.length > 0 ? `<div style="font-family:var(--mono);font-size:9px;letter-spacing:.15em;color:var(--dim);text-transform:uppercase;margin:${weapons.length?'12px':'0'} 0 6px;">Itens</div>${itemHtml}` : ''}
+        </div>
+      `;
+    }
+
+    const hasDetails = weapons.length > 0 || items.length > 0;
+
     const card = document.createElement('div');
     card.className = `combatant-card ${type}`;
+    card.style.cssText = 'display:block;padding:0;';
     card.innerHTML = `
-      <div class="c-avatar">${s.photo ? `<img src="${s.photo}" alt="">` : (s.name || '?')[0]}</div>
-      <div class="c-info">
-        <div class="c-name">${s.name || 'Sem nome'}</div>
-        <div class="c-type-tag">${typeLabel}</div>
-        <div class="c-bars">
-          <div class="bar-row">
-            <div class="bar-wrap"><div class="bar-fill ${hpClass}" style="width:${hpPct}%"></div></div>
-            <div class="bar-txt" style="color:var(--acc)">HP ${s.hp_cur}/${s.hp_max}</div>
+      <div style="display:grid;grid-template-columns:auto 1fr auto auto;gap:12px;align-items:center;padding:14px 16px;">
+        <div class="c-avatar">${s.photo ? `<img src="${s.photo}" alt="">` : (s.name || '?')[0]}</div>
+        <div class="c-info">
+          <div style="display:flex;align-items:center;gap:8px;">
+            <div class="c-name">${s.name || 'Sem nome'}</div>
+            <div class="c-type-tag">${typeLabel}</div>
           </div>
-          <div class="bar-row">
-            <div class="bar-wrap"><div class="bar-fill bar-san" style="width:${sanPct}%"></div></div>
-            <div class="bar-txt" style="color:var(--blue)">SAN ${s.san_cur}/${s.san_max}</div>
+          <div class="c-bars">
+            <div class="bar-row">
+              <div class="bar-wrap"><div class="bar-fill ${hpClass}" style="width:${hpPct}%"></div></div>
+              <div class="bar-txt" style="color:var(--acc)">HP ${s.hp_cur}/${s.hp_max}</div>
+            </div>
+            <div class="bar-row">
+              <div class="bar-wrap"><div class="bar-fill bar-san" style="width:${sanPct}%"></div></div>
+              <div class="bar-txt" style="color:var(--blue)">SAN ${s.san_cur}/${s.san_max}</div>
+            </div>
           </div>
         </div>
+        <div class="c-hp-ctrl">
+          <button class="hp-btn" onclick="adjustCombatHp('${s.id}',${s.hp_cur},${s.hp_max},-1)">−</button>
+          <input class="hp-num" type="number" value="${s.hp_cur}" onchange="setCombatHp('${s.id}',${s.hp_max},this.value)">
+          <button class="hp-btn" onclick="adjustCombatHp('${s.id}',${s.hp_cur},${s.hp_max},1)">+</button>
+        </div>
+        <div style="display:flex;flex-direction:column;align-items:center;gap:6px;">
+          ${hasDetails ? `<button class="c-expand-btn" id="expand-btn-${row.id}" onclick="toggleCombatExpand(${row.id})" title="Ver armas e itens" style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:16px;line-height:1;transition:color .15s;padding:2px;" onmouseover="this.style.color='var(--acc)'" onmouseout="this.style.color='var(--muted)'">⌄</button>` : '<span style="width:22px;"></span>'}
+          <button class="c-remove" onclick="removeCombatant(${row.id})" title="Remover">×</button>
+        </div>
       </div>
-      <div class="c-hp-ctrl">
-        <button class="hp-btn" onclick="adjustCombatHp('${s.id}',${s.hp_cur},${s.hp_max},-1)">−</button>
-        <input class="hp-num" type="number" value="${s.hp_cur}" onchange="setCombatHp('${s.id}',${s.hp_max},this.value)">
-        <button class="hp-btn" onclick="adjustCombatHp('${s.id}',${s.hp_cur},${s.hp_max},1)">+</button>
-      </div>
-      <button class="c-remove" onclick="removeCombatant(${row.id})" title="Remover">×</button>
+      ${expandHtml}
     `;
     list.appendChild(card);
   });
+}
+
+function toggleCombatExpand(rowId) {
+  const el = document.getElementById(`expand-${rowId}`);
+  const btn = document.getElementById(`expand-btn-${rowId}`);
+  if (!el) return;
+  const open = el.style.display === 'none';
+  el.style.display = open ? 'block' : 'none';
+  if (btn) btn.style.transform = open ? 'rotate(180deg)' : '';
 }
 
 async function adjustCombatHp(sheetId, cur, max, delta) {
@@ -1660,13 +1732,15 @@ async function showPlayerView(id) {
   const sanPct = s.san_max ? Math.max(0, Math.min(100, (s.san_cur / s.san_max) * 100)) : 0;
   const attrs = s.attrs || defaultAttrs();
 
-  // Load custom dice for player
   const { data: customDiceData } = await SB.from('custom_dice').select('*').order('created_at');
+
+  // Load recent dice rolls for this player
+  const { data: recentRolls } = await SB.from('dice_log')
+    .select('*').eq('sheet_id', id).order('created_at', { ascending: false }).limit(15);
 
   let attrsHtml = '<div class="ro-attrs">';
   ATTRS.forEach(a => {
     const av = attrs[a] || { val: 0, max: 100 };
-    const pct = av.max ? (av.val / av.max) * 100 : 0;
     attrsHtml += `
       <div class="ed-attr">
         <span class="ed-attr-name">${a}</span>
@@ -1719,12 +1793,51 @@ async function showPlayerView(id) {
     </div>
   `).join('');
 
-  // Custom dice chips for player
   const chipHtml = (customDiceData || []).map(d => `
     <div class="chip" onclick="selectPlayerCustomDice(${d.faces},this)">${d.name} <span style="color:var(--acc);font-size:9px;">D${d.faces}</span></div>
   `).join('');
 
-  document.getElementById('player-body').innerHTML = `
+  const recentFeedHtml = (recentRolls || []).map(row => {
+    const t = new Date(row.created_at).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+    return `<div class="dice-log-item">
+      <span style="flex:1;color:var(--dim);font-size:9px;font-family:var(--mono);">${row.dice_expr}</span>
+      <span class="dice-log-val">${row.total}</span>
+      <span style="color:var(--dim);font-size:9px;font-family:var(--mono);">${t}</span>
+    </div>`;
+  }).join('');
+
+  // ── DICE SIDEBAR HTML ──
+  const diceSidebarHtml = `
+    <div style="font-family:var(--mono);font-size:9px;letter-spacing:.2em;text-transform:uppercase;color:var(--dim);margin-bottom:14px;">Dados</div>
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:5px;margin-bottom:10px;" id="player-dice-panel">
+      <div class="d-btn active" onclick="selectDice(6,this,'player')">D6</div>
+      <div class="d-btn" onclick="selectDice(4,this,'player')">D4</div>
+      <div class="d-btn" onclick="selectDice(8,this,'player')">D8</div>
+      <div class="d-btn" onclick="selectDice(10,this,'player')">D10</div>
+      <div class="d-btn" onclick="selectDice(12,this,'player')">D12</div>
+      <div class="d-btn" onclick="selectDice(20,this,'player')">D20</div>
+      <div class="d-btn" onclick="selectDice(100,this,'player')">D100</div>
+      <div class="d-btn" onclick="selectDice(2,this,'player')">Moeda</div>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:10px;">
+      <div class="f-group"><label class="f-label">Qtd</label><input class="f-input f-mono" type="number" id="player-qty" value="1" min="1" max="20" style="padding:6px 8px;"></div>
+      <div class="f-group"><label class="f-label">+Mod</label><input class="f-input f-mono" type="number" id="player-mod" value="0" style="padding:6px 8px;"></div>
+    </div>
+    <div class="dice-result-box" style="margin-bottom:10px;">
+      <div class="dice-result-num" id="player-result">—</div>
+      <div class="dice-result-sub" id="player-result-sub">escolha um dado</div>
+    </div>
+    <button class="roll-btn" onclick="rollDice('player','${id}')" style="margin-bottom:10px;">Rolar</button>
+    ${chipHtml ? `
+      <div style="font-family:var(--mono);font-size:9px;letter-spacing:.12em;color:var(--dim);text-transform:uppercase;margin-bottom:6px;">Personalizados</div>
+      <div class="custom-dice-chips" id="player-chips" style="margin-bottom:12px;">${chipHtml}</div>
+    ` : ''}
+    <div style="font-family:var(--mono);font-size:9px;letter-spacing:.12em;color:var(--dim);text-transform:uppercase;margin-bottom:6px;">Histórico</div>
+    <div class="dice-log-wrap" id="player-dice-feed" style="flex:1;">${recentFeedHtml}</div>
+  `;
+
+  // ── MAIN CONTENT HTML ──
+  const mainHtml = `
     <div class="player-top">
       <div class="player-av">${s.photo ? `<img src="${s.photo}" alt="">` : (s.name || '?')[0]}</div>
       <div style="flex:1;">
@@ -1736,21 +1849,29 @@ async function showPlayerView(id) {
 
     <div class="player-vitals">
       <div class="p-vital">
-        <div class="p-vital-label">HP</div>
+        <div class="p-vital-label">Pontos de Vida</div>
         <div class="p-vital-val" style="color:var(--acc)" id="p-hp-display">${s.hp_cur} <span style="font-size:14px;color:var(--dim)">/ ${s.hp_max}</span></div>
-        <div class="p-vital-bar"><div class="p-vital-fill-hp" id="p-hp-bar" style="width:${hpPct}%"></div></div>
-        <div class="p-vital-inputs">
+        <div class="p-vital-bar" style="height:3px;background:var(--bg5);border-radius:2px;overflow:hidden;margin-bottom:8px;">
+          <div class="p-vital-fill-hp" id="p-hp-bar" style="width:${hpPct}%;height:100%;background:var(--acc);border-radius:2px;"></div>
+        </div>
+        <div class="p-vital-ctrl">
+          <button class="p-vital-btn p-minus" onclick="playerAdjustVital('${id}','hp_cur',${s.hp_cur},${s.hp_max},-1)">−</button>
           <input class="p-vital-input" type="number" id="p-hp-input" value="${s.hp_cur}" min="0" max="${s.hp_max}" onchange="playerPatchVital('${id}','hp_cur',this.value,${s.hp_max})">
-          <span style="color:var(--dim);font-family:var(--mono);font-size:12px;">/ ${s.hp_max}</span>
+          <button class="p-vital-btn p-plus" onclick="playerAdjustVital('${id}','hp_cur',${s.hp_cur},${s.hp_max},1)">+</button>
+          <span style="color:var(--dim);font-family:var(--mono);font-size:11px;margin-left:2px;">/ ${s.hp_max}</span>
         </div>
       </div>
       <div class="p-vital">
         <div class="p-vital-label">Sanidade</div>
         <div class="p-vital-val" style="color:var(--blue)" id="p-san-display">${s.san_cur} <span style="font-size:14px;color:var(--dim)">/ ${s.san_max}</span></div>
-        <div class="p-vital-bar"><div class="p-vital-fill-san" id="p-san-bar" style="width:${sanPct}%"></div></div>
-        <div class="p-vital-inputs">
+        <div class="p-vital-bar" style="height:3px;background:var(--bg5);border-radius:2px;overflow:hidden;margin-bottom:8px;">
+          <div class="p-vital-fill-san" id="p-san-bar" style="width:${sanPct}%;height:100%;background:var(--blue);border-radius:2px;"></div>
+        </div>
+        <div class="p-vital-ctrl">
+          <button class="p-vital-btn p-minus" onclick="playerAdjustVital('${id}','san_cur',${s.san_cur},${s.san_max},-1)">−</button>
           <input class="p-vital-input" type="number" id="p-san-input" value="${s.san_cur}" min="0" max="${s.san_max}" onchange="playerPatchVital('${id}','san_cur',this.value,${s.san_max})">
-          <span style="color:var(--dim);font-family:var(--mono);font-size:12px;">/ ${s.san_max}</span>
+          <button class="p-vital-btn p-plus" onclick="playerAdjustVital('${id}','san_cur',${s.san_cur},${s.san_max},1)">+</button>
+          <span style="color:var(--dim);font-family:var(--mono);font-size:11px;margin-left:2px;">/ ${s.san_max}</span>
         </div>
       </div>
     </div>
@@ -1759,51 +1880,12 @@ async function showPlayerView(id) {
       <button class="p-tab active" onclick="switchPTab('attrs',this)">Atributos</button>
       <button class="p-tab" onclick="switchPTab('weapons',this)">Armas</button>
       <button class="p-tab" onclick="switchPTab('items',this)">Itens</button>
-      <button class="p-tab" onclick="switchPTab('dice',this)">Dados</button>
       <button class="p-tab" onclick="switchPTab('notes',this)">Anotações</button>
     </div>
 
-    <div class="p-tab-content active" id="ptab-attrs">
-      ${attrsHtml}
-    </div>
-    <div class="p-tab-content" id="ptab-weapons">
-      ${weaponsHtml || '<div class="empty-state">Nenhuma arma.</div>'}
-    </div>
-    <div class="p-tab-content" id="ptab-items">
-      ${itemsHtml}
-    </div>
-    <div class="p-tab-content" id="ptab-dice">
-      <div class="p-dice-panel" id="player-dice-panel">
-        <div class="dice-panel-title">Dados — ${s.name || 'Jogador'}</div>
-        <div class="dice-grid" style="grid-template-columns:repeat(4,1fr);">
-          <div class="d-btn active" onclick="selectDice(6,this,'player')">D6</div>
-          <div class="d-btn" onclick="selectDice(4,this,'player')">D4</div>
-          <div class="d-btn" onclick="selectDice(8,this,'player')">D8</div>
-          <div class="d-btn" onclick="selectDice(10,this,'player')">D10</div>
-          <div class="d-btn" onclick="selectDice(12,this,'player')">D12</div>
-          <div class="d-btn" onclick="selectDice(20,this,'player')">D20</div>
-          <div class="d-btn" onclick="selectDice(100,this,'player')">D100</div>
-          <div class="d-btn" onclick="selectDice(2,this,'player')">Moeda</div>
-        </div>
-        <div class="dice-mods" style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:10px 0;">
-          <div class="f-group"><label class="f-label">Qtd</label><input class="f-input f-mono" type="number" id="player-qty" value="1" min="1" max="20"></div>
-          <div class="f-group"><label class="f-label">+Mod</label><input class="f-input f-mono" type="number" id="player-mod" value="0"></div>
-        </div>
-        <div class="dice-result-box">
-          <div class="dice-result-num" id="player-result">—</div>
-          <div class="dice-result-sub" id="player-result-sub">escolha um dado</div>
-        </div>
-        <button class="roll-btn" onclick="rollDice('player','${id}')">Rolar</button>
-        ${chipHtml ? `
-          <div style="font-family:var(--mono);font-size:9px;letter-spacing:.15em;color:var(--dim);text-transform:uppercase;margin-bottom:8px;">Dados Personalizados</div>
-          <div class="custom-dice-chips" id="player-chips">${chipHtml}</div>
-        ` : ''}
-        <div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--line);">
-          <div style="font-family:var(--mono);font-size:9px;letter-spacing:.15em;color:var(--dim);text-transform:uppercase;margin-bottom:8px;">Seus Lançamentos</div>
-          <div class="dice-log-wrap" id="player-dice-feed"></div>
-        </div>
-      </div>
-    </div>
+    <div class="p-tab-content active" id="ptab-attrs">${attrsHtml}</div>
+    <div class="p-tab-content" id="ptab-weapons">${weaponsHtml || '<div class="empty-state">Nenhuma arma.</div>'}</div>
+    <div class="p-tab-content" id="ptab-items">${itemsHtml}</div>
     <div class="p-tab-content" id="ptab-notes">
       <div class="f-group" style="margin-bottom:12px;">
         <label class="f-label">Suas Anotações</label>
@@ -1816,19 +1898,50 @@ async function showPlayerView(id) {
     </div>
   `;
 
+  document.getElementById('player-body').innerHTML = `
+    <div class="player-root">
+      <div class="player-main">${mainHtml}</div>
+      <div class="player-dice-sidebar">${diceSidebarHtml}</div>
+    </div>
+  `;
+
   showView('player');
 
-  // Setup realtime for player
-  SB.channel('player-' + id)
-    .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'sheets', filter: `id=eq.${id}` }, (payload) => {
+  // ── REALTIME for player ──
+  // Unsubscribe any previous channel
+  if (window._playerChannel) { SB.removeChannel(window._playerChannel); }
+
+  window._playerChannel = SB.channel('player-sheet-' + id)
+    .on('postgres_changes', {
+      event: 'UPDATE', schema: 'public', table: 'sheets',
+      filter: `id=eq.${id}`
+    }, (payload) => {
       const upd = payload.new;
-      // Update HP/SAN displays
-      const hpEl = document.getElementById('p-hp-display');
-      if (hpEl) hpEl.innerHTML = `${upd.hp_cur} <span style="font-size:14px;color:var(--dim)">/ ${upd.hp_max}</span>`;
-      const hpBar = document.getElementById('p-hp-bar');
-      if (hpBar) hpBar.style.width = upd.hp_max ? `${(upd.hp_cur/upd.hp_max)*100}%` : '0%';
+      if (!upd) return;
+
+      // HP
+      const hpPct2 = upd.hp_max ? Math.max(0, Math.min(100, (upd.hp_cur / upd.hp_max) * 100)) : 0;
+      const hpDisp = document.getElementById('p-hp-display');
+      if (hpDisp) hpDisp.innerHTML = `${upd.hp_cur} <span style="font-size:14px;color:var(--dim)">/ ${upd.hp_max}</span>`;
+      const hpBar2 = document.getElementById('p-hp-bar');
+      if (hpBar2) hpBar2.style.width = hpPct2 + '%';
       const hpInp = document.getElementById('p-hp-input');
-      if (hpInp) hpInp.value = upd.hp_cur;
+      if (hpInp && document.activeElement !== hpInp) hpInp.value = upd.hp_cur;
+
+      // SAN
+      const sanPct2 = upd.san_max ? Math.max(0, Math.min(100, (upd.san_cur / upd.san_max) * 100)) : 0;
+      const sanDisp = document.getElementById('p-san-display');
+      if (sanDisp) sanDisp.innerHTML = `${upd.san_cur} <span style="font-size:14px;color:var(--dim)">/ ${upd.san_max}</span>`;
+      const sanBar2 = document.getElementById('p-san-bar');
+      if (sanBar2) sanBar2.style.width = sanPct2 + '%';
+      const sanInp = document.getElementById('p-san-input');
+      if (sanInp && document.activeElement !== sanInp) sanInp.value = upd.san_cur;
+    })
+    .on('postgres_changes', {
+      event: 'INSERT', schema: 'public', table: 'dice_log',
+      filter: `sheet_id=eq.${id}`
+    }, (payload) => {
+      if (payload.new) prependDiceLogItem(payload.new, 'player-dice-feed');
     })
     .subscribe();
 }
@@ -1854,6 +1967,21 @@ function schedulePlayerNoteSave(id) {
     const val = document.getElementById('p-notes')?.value;
     if (val !== undefined) await SB.from('sheets').update({ notes: val }).eq('id', id);
   }, 800);
+}
+
+async function playerAdjustVital(id, field, cur, max, delta) {
+  const next = Math.max(0, Math.min(max, cur + delta));
+  await SB.from('sheets').update({ [field]: next }).eq('id', id);
+  // Update input immediately for responsiveness
+  const inputId = field === 'hp_cur' ? 'p-hp-input' : 'p-san-input';
+  const inp = document.getElementById(inputId);
+  if (inp) inp.value = next;
+  const dispId = field === 'hp_cur' ? 'p-hp-display' : 'p-san-display';
+  const disp = document.getElementById(dispId);
+  if (disp) disp.innerHTML = `${next} <span style="font-size:14px;color:var(--dim)">/ ${max}</span>`;
+  const barId = field === 'hp_cur' ? 'p-hp-bar' : 'p-san-bar';
+  const bar = document.getElementById(barId);
+  if (bar) bar.style.width = max ? `${(next/max)*100}%` : '0%';
 }
 
 async function playerPatchVital(id, field, value, max) {
